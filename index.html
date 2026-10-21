@@ -1,349 +1,940 @@
-/* =====================================================================
-   差し替え用パッチ
-   元の <script> 内の以下を置き換えてください。
-     1) function solveCircuit() { ... } 全体  → 下の「回路ソルバー」一式
-     2) function exportUSDZ() { ... } 全体   → 下の「USDZ出力」
-     3) touchend 内の1行修正 (ファイル末尾のコメント参照)
-   crc32() / PARTS / 他の関数はそのままでOKです。
-   ===================================================================== */
+<!DOCTYPE html>
+<html lang="ja" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>教科書回路図パズル (JIS C 0617 準拠シミュレータ)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&display=swap');
 
-
-/* ================= 回路ソルバー (節点解析) =================
-   - 各セルの「ポート」を節点にして、導線・部品を抵抗として扱い連立方程式を解く
-   - 並列・直列・分岐・ショート・LEDの極性・開いたスイッチが物理的に正しく動く
-   - 電流の向きは＋極から出る向き (乾電池の＋は左側ポート = ports[0])
-   ======================================================================= */
-const E_BATTERY = 1.5;     // 乾電池1個の電圧 [V]
-const R_INTERNAL = 0.5;    // 乾電池の内部抵抗 [Ω]
-const G_WIRE = 100;        // 導線のコンダクタンス (≒ほぼ0Ω)
-const G_LEAK = 1e-7;       // 浮いた節点の安定化用
-const I_ON = 1e-4;         // これ以上の電流で「通電」とみなす [A]
-const I_SHORT = 1.0;       // 電池がこれ以上出したらショート扱い [A]
-const R_ELEM = { bulb: 10, resistor: 20, ammeter: 0.01, voltmeter: 1e6, led: 5, switch: 0.001 };
-
-function solveLinear(A, rhs) {
-    const n = rhs.length;
-    for (let i = 0; i < n; i++) {
-        let p = i;
-        for (let k = i + 1; k < n; k++) if (Math.abs(A[k][i]) > Math.abs(A[p][i])) p = k;
-        [A[i], A[p]] = [A[p], A[i]];
-        [rhs[i], rhs[p]] = [rhs[p], rhs[i]];
-        const d = A[i][i];
-        for (let k = i + 1; k < n; k++) {
-            const f = A[k][i] / d;
-            if (!f) continue;
-            for (let j = i; j < n; j++) A[k][j] -= f * A[i][j];
-            rhs[k] -= f * rhs[i];
+        html, body {
+            height: 100%;
+            height: 100dvh;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: 'Noto Sans JP', sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
         }
-    }
-    const x = new Array(n).fill(0);
-    for (let i = n - 1; i >= 0; i--) {
-        let s = rhs[i];
-        for (let j = i + 1; j < n; j++) s -= A[i][j] * x[j];
-        x[i] = s / A[i][i];
-    }
-    return x;
-}
 
-function solveCircuit() {
-    let any = false, hasBattery = false;
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            const cell = grid[r][c];
-            if (!cell) continue;
-            any = true;
-            if (cell.type === 'battery') hasBattery = true;
-            cell.powered = false;
-            cell.flowDir = 'fwd';
+        .grid-bg {
+            background-image: radial-gradient(rgba(148, 163, 184, 0.15) 1.5px, transparent 1.5px);
+            background-size: 24px 24px;
         }
-    }
-    if (!any) { updateStatus(false, "盤面にパーツを配置してください"); return; }
-    if (!hasBattery) { updateStatus(false, "開回路（電流なし）: 乾電池が配置されていません"); return; }
 
-    const OFF = [[-1, 0], [0, 1], [1, 0], [0, -1]]; // 0:上 1:右 2:下 3:左
-    const idMap = new Map();
-    const nid = (r, c, d) => {               // d=0..3: ポート, d=4: セル中心
-        const k = (r * COLS + c) * 5 + d;
-        if (!idMap.has(k)) idMap.set(k, idMap.size);
-        return idMap.get(k);
-    };
-    const portsOf = (cell) => {
-        const s = (cell.rotation || 0) / 90;
-        return PARTS[cell.type].ports.map(p => (p + s) % 4);
-    };
+        @keyframes flowFwd {
+            from { stroke-dashoffset: 16; }
+            to { stroke-dashoffset: 0; }
+        }
+        @keyframes flowRev {
+            from { stroke-dashoffset: 0; }
+            to { stroke-dashoffset: 16; }
+        }
+        .current-wire-fwd {
+            stroke-dasharray: 6 6;
+            animation: flowFwd 0.8s linear infinite;
+        }
+        .current-wire-rev {
+            stroke-dasharray: 6 6;
+            animation: flowRev 0.8s linear infinite;
+        }
 
-    // ---- 辺（抵抗・導線・接続）を作る ----
-    const edges = [];
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            const cell = grid[r][c];
-            if (!cell) continue;
-            const t = cell.type;
-            const ports = portsOf(cell);
+        #touch-ghost {
+            position: fixed;
+            pointer-events: none;
+            z-index: 9999;
+            width: 52px;
+            height: 52px;
+            transform: translate(-50%, -50%);
+            display: none;
+        }
 
-            if (t.startsWith('wire_')) {
-                const ctr = nid(r, c, 4);
-                ports.forEach((p, i) => edges.push({
-                    a: ctr, b: nid(r, c, p), g: G_WIRE, kind: 'wire', r, c, local: PARTS[t].ports[i]
-                }));
-            } else if (t === 'switch' && !cell.state.on) {
-                // 開いたスイッチ: 内部で切れている
-            } else if (t === 'battery') {
-                edges.push({ a: nid(r, c, ports[0]), b: nid(r, c, ports[1]), g: 1 / R_INTERNAL, kind: 'battery', r, c });
-            } else {
-                edges.push({ a: nid(r, c, ports[0]), b: nid(r, c, ports[1]), g: 1 / R_ELEM[t], kind: t, r, c, on: true });
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); }
+        ::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); border-radius: 3px; }
+
+        @media print {
+            @page { size: A4 landscape; margin: 8mm; }
+            html, body {
+                height: auto !important;
+                overflow: visible !important;
+                background-color: #ffffff !important;
+                color: #0f172a !important;
             }
-
-            // 右・下の隣と、向かい合うポート同士をつなぐ（二重登録を避ける）
-            [1, 2].forEach(d => {
-                if (!ports.includes(d)) return;
-                const nr = r + OFF[d][0], nc = c + OFF[d][1];
-                if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) return;
-                const nb = grid[nr][nc];
-                if (!nb) return;
-                const opp = (d + 2) % 4;
-                if (!portsOf(nb).includes(opp)) return;
-                edges.push({ a: nid(r, c, d), b: nid(nr, nc, opp), g: G_WIRE, kind: 'link' });
-            });
-        }
-    }
-
-    // ---- 連立方程式を解く（LEDは順方向のみ導通させるため反復） ----
-    const n = idMap.size;
-    const leds = edges.filter(e => e.kind === 'led');
-    let v = new Array(n).fill(0);
-    for (let it = 0; it < 8; it++) {
-        const A = Array.from({ length: n }, () => new Array(n).fill(0));
-        const rhs = new Array(n).fill(0);
-        for (let i = 0; i < n; i++) A[i][i] += G_LEAK;
-        edges.forEach(e => {
-            if (e.kind === 'led' && !e.on) return;
-            A[e.a][e.a] += e.g; A[e.b][e.b] += e.g;
-            A[e.a][e.b] -= e.g; A[e.b][e.a] -= e.g;
-            if (e.kind === 'battery') {           // ノートン等価: ＋極(a)へ電流を注入
-                rhs[e.a] += E_BATTERY * e.g;
-                rhs[e.b] -= E_BATTERY * e.g;
+            header, aside, #trash-bin, #touch-ghost, .no-print, #active-selection-banner, #status-banner {
+                display: none !important;
             }
-        });
-        v = solveLinear(A, rhs);
-        let changed = false;
-        leds.forEach(e => {
-            const on = (v[e.a] - v[e.b]) > 1e-9;  // アノード(左)が高電位のときだけON
-            if (on !== e.on) { e.on = on; changed = true; }
-        });
-        if (!changed) break;
-    }
-
-    // ---- 電流から通電状態・向きを決める ----
-    let anyPowered = false, short = false;
-    edges.forEach(e => {
-        if (e.kind === 'link') return;
-        const cell = grid[e.r][e.c];
-        let I;
-        if (e.kind === 'wire') {
-            I = (v[e.a] - v[e.b]) * e.g;          // 中心 → ポート方向
-            if (Math.abs(I) > I_ON) {
-                cell.powered = true;
-                if (e.local === 1) cell.flowDir = I >= 0 ? 'fwd' : 'rev'; // 描画の終点側
+            main {
+                padding: 0 !important;
+                background: transparent !important;
+                height: auto !important;
+                overflow: visible !important;
             }
-            return;
+            #board-container {
+                border: 2px solid #0f172a !important;
+                background-color: #ffffff !important;
+                box-shadow: none !important;
+                padding: 8px !important;
+            }
+            .grid-cell-print {
+                border: 1px dashed #cbd5e1 !important;
+                background-color: #f8fafc !important;
+            }
+            #print-header { display: block !important; }
+            svg text, svg line, svg circle, svg path, svg polygon {
+                stroke-dasharray: none !important;
+            }
         }
-        if (e.kind === 'led' && !e.on) return;
-        if (e.kind === 'battery') {
-            const out = (E_BATTERY - (v[e.a] - v[e.b])) * e.g; // ＋極から外へ出る電流
-            if (out > I_SHORT) short = true;
-            I = -out;   // 電池内部は −極(右) → ＋極(左) = 逆向き
-        } else {
-            I = (v[e.a] - v[e.b]) * e.g;          // 左 → 右 が fwd
-        }
-        if (Math.abs(I) > I_ON) {
-            cell.powered = true;
-            cell.flowDir = I >= 0 ? 'fwd' : 'rev';
-            if (e.kind === 'battery') anyPowered = true;
-        }
-    });
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 flex flex-col h-full h-[100dvh]">
 
-    if (short) {
-        updateStatus(true, "⚠ ショート回路: 電池が導線だけでつながっています（電池が熱くなり危険）");
-    } else if (anyPowered) {
-        updateStatus(true, "閉回路完成（通電中）: ＋極から−極へ電流が流れています");
-    } else {
-        updateStatus(false, "開回路（電流なし）: 乾電池からループがつながっていません");
-    }
-}
+    <div id="touch-ghost" class="bg-blue-600/90 rounded-xl p-2 border-2 border-blue-400 shadow-2xl flex items-center justify-center pointer-events-none"></div>
 
+    <header class="h-14 bg-slate-900 border-b border-slate-800 px-4 shrink-0 flex items-center justify-between shadow-md z-20">
+        <div class="flex items-center space-x-3">
+            <div class="bg-blue-600 p-2 rounded-lg text-white shadow-lg shadow-blue-600/30">
+                <i class="fa-solid fa-bolt text-lg"></i>
+            </div>
+            <div>
+                <h1 class="text-base font-black tracking-wide bg-gradient-to-r from-blue-400 via-sky-300 to-emerald-400 bg-clip-text text-transparent leading-none">
+                    教科書回路図パズル
+                </h1>
+                <p class="text-[10px] text-slate-400 font-medium mt-0.5">小・中学校 理科教科書記号 (JIS C 0617) 準拠</p>
+            </div>
+        </div>
 
-/* ================= USDZ出力 =================
-   - 1マス = 5cm (metersPerUnit=0.05) → ARで盤面が約50cm幅
-   - 全部品に3Dモデルを用意、円柱は軸をY向きに修正
-   - ZIPのパディングを正式なextra fieldとして書き込み（64byteアライメント）
-   ============================================ */
-function exportUSDZ() {
-    const MATS = {
-        BoardMat: [.05, .08, .14], TileMat: [.08, .12, .22], PoweredTileMat: [.12, .2, .35],
-        WireMat: [.2, .8, 1], UnpoweredWireMat: [.6, .65, .7], GoldMat: [1, .75, .1],
-        SilverMat: [.9, .9, .95], BulbMat: [1, .85, .1], LedMat: [.9, .1, .1],
-        AmMat: [.2, .6, .95], VoMat: [.75, .5, .95]
-    };
-    const mat = (n) => `</CircuitBoard/Materials/${n}>`;
-    const f = (x) => Number(x).toFixed(3);
-    const prim = (type, name, t, s, m) =>
-        `        def ${type} "${name}"\n        {\n` +
-        (type === 'Cylinder' ? `            uniform token axis = "Y"\n` : '') +
-        `            double3 xformOp:translate = (${t.map(f).join(', ')})\n` +
-        `            double3 xformOp:scale = (${s.map(f).join(', ')})\n` +
-        `            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]\n` +
-        `            rel material:binding = ${mat(m)}\n        }\n`;
+        <div class="flex items-center space-x-2">
+            <button onclick="exportUSDZ()" class="bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white px-3 py-1.5 rounded-lg font-bold text-xs flex items-center space-x-1.5 shadow-md transition border border-indigo-400/30">
+                <i class="fa-solid fa-cube text-xs"></i>
+                <span class="hidden sm:inline">USDZ 3D出力 (AR)</span>
+                <span class="sm:hidden">3D</span>
+            </button>
+            <button onclick="printCircuit()" class="bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white px-3 py-1.5 rounded-lg font-bold text-xs flex items-center space-x-1.5 shadow-md transition border border-emerald-400/30">
+                <i class="fa-solid fa-print text-xs"></i>
+                <span class="hidden sm:inline">印刷 / PDF出力</span>
+                <span class="sm:hidden">印刷</span>
+            </button>
+            <button onclick="resetBoard()" class="bg-slate-800 hover:bg-slate-700 active:scale-95 text-slate-300 px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1 transition border border-slate-700">
+                <i class="fa-solid fa-rotate-right"></i>
+                <span class="hidden sm:inline">リセット</span>
+            </button>
+        </div>
+    </header>
 
-    let usda = `#usda 1.0\n(\n    defaultPrim = "CircuitBoard"\n    metersPerUnit = 0.05\n    upAxis = "Y"\n)\n\n`;
-    usda += `def Xform "CircuitBoard"\n(\n    kind = "component"\n)\n{\n    def Scope "Materials"\n    {\n`;
-    Object.keys(MATS).forEach(name => {
-        usda += `        def Material "${name}"\n        {\n` +
-            `            token outputs:surface.connect = </CircuitBoard/Materials/${name}/PBR.outputs:surface>\n` +
-            `            def Shader "PBR"\n            {\n` +
-            `                uniform token info:id = "UsdPreviewSurface"\n` +
-            `                color3f inputs:diffuseColor = (${MATS[name].join(', ')})\n` +
-            `                token outputs:surface\n            }\n        }\n`;
-    });
-    usda += `    }\n`;
-    usda += `    def Cube "BaseBoard"\n    {\n` +
-        `        double3 xformOp:translate = (0, -0.05, 0)\n` +
-        `        double3 xformOp:scale = (${f(COLS / 2 * 1.0 + 0.2)}, 0.05, ${f(ROWS / 2 * 1.0 + 0.2)})\n` +
-        `        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]\n` +
-        `        rel material:binding = ${mat('BoardMat')}\n    }\n`;
+    <div class="flex-1 flex min-h-0 overflow-hidden relative">
 
-    const DIR = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // [x, z]
-    let tileIdx = 0;
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            const cell = grid[r][c];
-            if (!cell) continue;
-            const posX = (c - (COLS - 1) / 2), posZ = (r - (ROWS - 1) / 2);
-            const wm = cell.powered ? 'WireMat' : 'UnpoweredWireMat';
-            const tm = cell.powered ? 'PoweredTileMat' : 'TileMat';
-            const t = cell.type;
+        <aside class="w-64 bg-slate-900 border-r border-slate-800 p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto">
+            <div class="flex items-center justify-between mb-2">
+                <h2 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center space-x-1">
+                    <i class="fa-solid fa-boxes-stacked text-blue-400"></i>
+                    <span>電気記号パレット</span>
+                </h2>
+                <span class="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full">タップ / ドラッグ</span>
+            </div>
 
-            usda += `    def Xform "Tile_${tileIdx++}"\n    {\n` +
-                `        double3 xformOp:translate = (${f(posX)}, 0.02, ${f(posZ)})\n` +
-                `        float3 xformOp:rotateXYZ = (0, ${-(cell.rotation || 0)}, 0)\n` +
-                `        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]\n`;
-            usda += prim('Cube', 'TileBase', [0, 0, 0], [0.46, 0.02, 0.46], tm);
+            <div id="active-selection-banner" class="hidden mb-2 bg-blue-950/80 border border-blue-500/50 rounded-lg p-1.5 text-xs flex items-center justify-between animate-pulse">
+                <div class="flex items-center space-x-1.5 min-w-0">
+                    <span class="w-2 h-2 rounded-full bg-blue-400 shrink-0"></span>
+                    <span id="active-part-name" class="font-bold text-blue-200 text-[10px] truncate"></span>
+                </div>
+                <button onclick="clearSelectedPart()" class="text-slate-400 hover:text-white px-1.5 py-0.5 text-[9px] bg-slate-800 rounded shrink-0 font-bold">解除</button>
+            </div>
 
-            if (t.startsWith('wire_')) {
-                // ローカルのポート方向へ中心から縁まで導線を伸ばす
-                PARTS[t].ports.forEach((p, i) => {
-                    const [dx, dz] = DIR[p];
-                    const s = dx !== 0 ? [0.23, 0.015, 0.04] : [0.04, 0.015, 0.23];
-                    usda += prim('Cube', `Wire${i}`, [dx * 0.23, 0.03, dz * 0.23], s, wm);
-                });
-            } else {
-                // 2端子部品: 左右の足
-                usda += prim('Cube', 'LegL', [-0.3, 0.03, 0], [0.16, 0.015, 0.04], wm);
-                usda += prim('Cube', 'LegR', [0.3, 0.03, 0], [0.16, 0.015, 0.04], wm);
-                if (t === 'battery') {
-                    usda += prim('Cube', 'PosPlate', [-0.08, 0.06, 0], [0.02, 0.08, 0.24], 'GoldMat');
-                    usda += prim('Cube', 'NegPlate', [0.08, 0.06, 0], [0.04, 0.05, 0.16], 'SilverMat');
-                } else if (t === 'bulb') {
-                    usda += prim('Cylinder', 'Bulb', [0, 0.04, 0], [0.22, 0.02, 0.22], 'BulbMat');
-                } else if (t === 'ammeter') {
-                    usda += prim('Cylinder', 'Ammeter', [0, 0.04, 0], [0.22, 0.02, 0.22], 'AmMat');
-                } else if (t === 'voltmeter') {
-                    usda += prim('Cylinder', 'Voltmeter', [0, 0.04, 0], [0.22, 0.02, 0.22], 'VoMat');
-                } else if (t === 'resistor') {
-                    usda += prim('Cube', 'Resistor', [0, 0.05, 0], [0.2, 0.04, 0.1], 'GoldMat');
-                } else if (t === 'led') {
-                    usda += prim('Cube', 'LedBody', [-0.03, 0.05, 0], [0.12, 0.05, 0.12], 'LedMat');
-                    usda += prim('Cube', 'LedBar', [0.12, 0.06, 0], [0.02, 0.06, 0.15], 'SilverMat');
-                } else if (t === 'switch') {
-                    const ang = cell.state.on ? 0 : 25;   // 開いているときはレバーを持ち上げる
-                    usda += `        def Cube "Lever"\n        {\n` +
-                        `            double3 xformOp:translate = (0, ${f(cell.state.on ? 0.04 : 0.09)}, 0)\n` +
-                        `            float3 xformOp:rotateXYZ = (0, 0, ${ang})\n` +
-                        `            double3 xformOp:scale = (0.16, 0.012, 0.03)\n` +
-                        `            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]\n` +
-                        `            rel material:binding = ${mat('SilverMat')}\n        }\n`;
-                    usda += prim('Cylinder', 'ContactL', [-0.14, 0.04, 0], [0.04, 0.03, 0.04], 'GoldMat');
-                    usda += prim('Cylinder', 'ContactR', [0.14, 0.04, 0], [0.04, 0.03, 0.04], 'GoldMat');
+            <div id="palette" class="grid grid-cols-2 gap-2"></div>
+
+            <div class="mt-auto pt-2 text-[10px] text-slate-400 space-y-1 border-t border-slate-800/80">
+                <div class="font-bold text-slate-300 flex items-center space-x-1">
+                    <i class="fa-solid fa-circle-info text-blue-400 text-xs"></i>
+                    <span>操作方法</span>
+                </div>
+                <p>① <strong>掴んで置く:</strong> ドラッグ＆ドロップ（長押し移動対応）。</p>
+                <p>② <strong>タップで設置:</strong> パーツを選んでマスをタップ。</p>
+                <p>③ <strong>向きを変える:</strong> 同じパーツを選ぶか、解除状態でタップすると90度回転。</p>
+            </div>
+        </aside>
+
+        <main class="flex-1 grid-bg flex flex-col items-center justify-between p-3 relative min-h-0 overflow-hidden">
+
+            <div id="print-header" class="hidden w-full mb-4 text-slate-900">
+                <div class="flex justify-between items-end border-b-2 border-slate-900 pb-2">
+                    <div>
+                        <h1 class="text-xl font-black">理科 実験ワークシート：回路図パズル</h1>
+                        <p class="text-xs text-slate-600 mt-0.5">JIS C 0617 電気用図記号による電気回路の設計</p>
+                    </div>
+                    <div class="flex space-x-4 text-xs font-bold">
+                        <div>組: ________</div>
+                        <div>番: ________</div>
+                        <div>名前: ____________________</div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="status-banner" class="px-5 py-1.5 rounded-full border border-slate-800 bg-slate-900/90 backdrop-blur shadow-md flex items-center space-x-2.5 transition-all duration-300 shrink-0 mb-2">
+                <div id="status-dot" class="w-2.5 h-2.5 rounded-full bg-slate-600"></div>
+                <div id="status-text" class="text-xs font-bold text-slate-300">盤面にパーツを配置してください</div>
+            </div>
+
+            <div id="board-container" class="bg-slate-900/90 p-3 rounded-2xl border-2 border-slate-800 shadow-xl relative backdrop-blur flex items-center justify-center my-auto overflow-hidden">
+                <div id="grid-board" class="grid grid-cols-10 gap-1.5"></div>
+            </div>
+
+            <div id="trash-bin" class="absolute bottom-3 right-3 w-12 h-12 bg-slate-900/90 hover:bg-rose-950/70 border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-xl flex flex-col items-center justify-center text-slate-400 hover:text-rose-400 transition cursor-pointer shadow-xl backdrop-blur group z-10">
+                <i class="fa-solid fa-trash-can text-sm group-hover:scale-110 transition-transform pointer-events-none"></i>
+                <span class="text-[8px] font-bold mt-0.5 pointer-events-none">ゴミ箱</span>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const COLS = 10;
+        const ROWS = 6;
+
+        let grid = Array(ROWS).fill(null).map(() => Array(COLS).fill(null));
+        let selectedPalettePart = null;
+        let draggedData = null;
+        let touchState = null;
+
+        const PARTS = {
+            battery: {
+                name: "乾電池 (電源)",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="26" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="38" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="26" y1="16" x2="26" y2="48" stroke="#facc15" stroke-width="4.5"/>
+                        <line x1="38" y1="8" x2="38" y2="56" stroke="#94a3b8" stroke-width="4.5"/>
+                        <text x="20" y="14" fill="#facc15" font-size="11" font-weight="bold">+</text>
+                        <text x="44" y="14" fill="#cbd5e1" font-size="11" font-weight="bold">-</text>
+                    `;
+                }
+            },
+            switch: {
+                name: "スイッチ",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir, state) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    const leverY2 = (state && state.on) ? "32" : "16";
+                    return `
+                        <line x1="12" y1="32" x2="24" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="40" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <circle cx="24" cy="32" r="3.5" fill="#cbd5e1"/>
+                        <circle cx="40" cy="32" r="3.5" fill="#cbd5e1"/>
+                        <line x1="24" y1="32" x2="38" y2="${leverY2}" stroke="#38bdf8" stroke-width="3.5"/>
+                    `;
+                }
+            },
+            bulb: {
+                name: "豆電球",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    const bulbStroke = isPowered ? '#fde047' : '#facc15';
+                    const bulbFill = isPowered ? '#facc15' : 'none';
+                    return `
+                        <line x1="12" y1="32" x2="20" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="44" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <circle cx="32" cy="32" r="12" fill="${bulbFill}" stroke="${bulbStroke}" stroke-width="3"/>
+                        <line x1="23.5" y1="23.5" x2="40.5" y2="40.5" stroke="#facc15" stroke-width="2.5"/>
+                        <line x1="23.5" y1="40.5" x2="40.5" y2="23.5" stroke="#facc15" stroke-width="2.5"/>
+                    `;
+                }
+            },
+            led: {
+                name: "発光ダイオード",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="22" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="42" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <polygon points="22,20 22,44 42,32" fill="#ef4444"/>
+                        <line x1="42" y1="20" x2="42" y2="44" stroke="#ef4444" stroke-width="3.5"/>
+                        <line x1="32" y1="16" x2="42" y2="8" stroke="#facc15" stroke-width="2"/>
+                        <line x1="38" y1="20" x2="48" y2="12" stroke="#facc15" stroke-width="2"/>
+                    `;
+                }
+            },
+            resistor: {
+                name: "抵抗",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="20" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="44" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <rect x="20" y="22" width="24" height="20" fill="#1e293b" stroke="#facc15" stroke-width="2.5" rx="2"/>
+                    `;
+                }
+            },
+            ammeter: {
+                name: "電流計 (A)",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="20" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="44" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <circle cx="32" cy="32" r="12" fill="#0f172a" stroke="#38bdf8" stroke-width="3"/>
+                        <text x="32" y="37" fill="#38bdf8" font-size="14" font-weight="extrabold" text-anchor="middle">A</text>
+                    `;
+                }
+            },
+            voltmeter: {
+                name: "電圧計 (V)",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="20" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <line x1="44" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="3.5" class="${wireClass}"/>
+                        <circle cx="32" cy="32" r="12" fill="#0f172a" stroke="#c084fc" stroke-width="3"/>
+                        <text x="32" y="37" fill="#c084fc" font-size="14" font-weight="extrabold" text-anchor="middle">V</text>
+                    `;
+                }
+            },
+            wire_straight: {
+                name: "直線導線",
+                ports: [3, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `<line x1="12" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="5" stroke-linecap="round" class="${wireClass}"/>`;
+                }
+            },
+            wire_corner: {
+                name: "L字導線",
+                ports: [2, 1],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `<path d="M 32 52 L 32 32 L 52 32" fill="none" stroke="${wireColor}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" class="${wireClass}"/>`;
+                }
+            },
+            wire_t: {
+                name: "T字分岐導線",
+                ports: [3, 1, 2],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="5" class="${wireClass}"/>
+                        <line x1="32" y1="32" x2="32" y2="52" stroke="${wireColor}" stroke-width="5" class="${wireClass}"/>
+                    `;
+                }
+            },
+            wire_cross: {
+                name: "十字導線",
+                ports: [0, 1, 2, 3],
+                renderSvg: function(isPowered, flowDir) {
+                    const wireClass = isPowered ? (flowDir === 'rev' ? 'current-wire-rev' : 'current-wire-fwd') : '';
+                    const wireColor = isPowered ? '#38bdf8' : '#cbd5e1';
+                    return `
+                        <line x1="12" y1="32" x2="52" y2="32" stroke="${wireColor}" stroke-width="5" class="${wireClass}"/>
+                        <line x1="32" y1="12" x2="32" y2="52" stroke="${wireColor}" stroke-width="5" class="${wireClass}"/>
+                    `;
                 }
             }
+        };
+
+        function init() {
+            renderPalette();
+            renderGrid();
+            solveCircuit();
+            setupTouchSupport();
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') clearSelectedPart();
+            });
+        }
+
+        function renderPalette() {
+            const paletteEl = document.getElementById('palette');
+            if (!paletteEl) return;
+            paletteEl.innerHTML = '';
+            Object.keys(PARTS).forEach(key => {
+                const part = PARTS[key];
+                const card = document.createElement('div');
+                const isSelected = selectedPalettePart === key;
+
+                card.className = `bg-slate-800 hover:bg-slate-700/80 border ${isSelected ? 'border-blue-400 bg-blue-950/60 ring-2 ring-blue-500/50' : 'border-slate-700'} rounded-xl p-1.5 flex flex-col items-center justify-between cursor-pointer active:scale-95 transition shadow-sm group relative h-16`;
+                card.draggable = true;
+                card.dataset.type = key;
+
+                card.innerHTML = `
+                    ${isSelected ? '<span class="absolute top-1 right-1 w-1.5 h-1.5 bg-blue-400 rounded-full animate-ping"></span>' : ''}
+                    <div class="w-8 h-8 flex items-center justify-center transition-transform group-hover:scale-110 pointer-events-none">
+                        <svg class="w-full h-full text-slate-300" viewBox="0 0 64 64">${part.renderSvg(false, 'fwd', {on: true})}</svg>
+                    </div>
+                    <span class="text-[9px] font-bold ${isSelected ? 'text-blue-300' : 'text-slate-300'} group-hover:text-white text-center leading-tight pointer-events-none line-clamp-1">${part.name}</span>
+                `;
+
+                card.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    selectedPalettePart = (selectedPalettePart === key) ? null : key;
+                    updateSelectionBanner();
+                    renderPalette();
+                });
+
+                card.addEventListener('dragstart', () => {
+                    draggedData = { source: 'palette', type: key };
+                });
+
+                paletteEl.appendChild(card);
+            });
+        }
+
+        function updateSelectionBanner() {
+            const banner = document.getElementById('active-selection-banner');
+            const nameLabel = document.getElementById('active-part-name');
+            if (selectedPalettePart) {
+                nameLabel.textContent = `選択中: ${PARTS[selectedPalettePart].name}`;
+                banner.classList.remove('hidden');
+            } else {
+                banner.classList.add('hidden');
+            }
+        }
+
+        function clearSelectedPart() {
+            selectedPalettePart = null;
+            updateSelectionBanner();
+            renderPalette();
+        }
+
+        function renderGrid() {
+            const board = document.getElementById('grid-board');
+            if (!board) return;
+            board.innerHTML = '';
+
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    const cellData = grid[r][c];
+                    const cell = document.createElement('div');
+
+                    if (!cellData) {
+                        cell.className = "w-11 h-11 sm:w-12 sm:h-12 md:w-14 md:h-14 bg-slate-950/80 border border-slate-800 rounded-xl flex items-center justify-center relative cursor-pointer transition shadow-inner grid-cell-print hover:border-slate-600";
+                    } else {
+                        const partDef = PARTS[cellData.type];
+                        const isPowered = cellData.powered;
+                        const borderColor = isPowered ? 'border-sky-400 bg-sky-950/40 shadow-[0_0_12px_rgba(56,189,248,0.3)]' : 'border-slate-700 bg-slate-900';
+                        cell.className = `w-11 h-11 sm:w-12 sm:h-12 md:w-14 md:h-14 rounded-xl flex items-center justify-center relative transition border-2 ${borderColor} cursor-grab grid-cell-print`;
+                        cell.draggable = true;
+
+                        const flowDir = cellData.flowDir || 'fwd';
+                        const svgContent = partDef.renderSvg(isPowered, flowDir, cellData.state);
+
+                        cell.innerHTML = `
+                            <div class="w-full h-full flex items-center justify-center pointer-events-none" style="transform: rotate(${cellData.rotation}deg)">
+                                <svg class="w-9 h-9 sm:w-10 sm:h-10" viewBox="0 0 64 64">${svgContent}</svg>
+                            </div>
+                        `;
+
+                        cell.addEventListener('dragstart', () => {
+                            draggedData = { source: 'grid', r, c };
+                        });
+                    }
+
+                    cell.dataset.r = r;
+                    cell.dataset.c = c;
+
+                    cell.addEventListener('dragover', (e) => e.preventDefault());
+                    cell.addEventListener('drop', (e) => {
+                        e.preventDefault();
+                        handleDrop(r, c);
+                    });
+
+                    cell.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        if (selectedPalettePart) {
+                            if (grid[r][c] && grid[r][c].type === selectedPalettePart) {
+                                const item = grid[r][c];
+                                item.rotation = (item.rotation + 90) % 360;
+                            } else {
+                                grid[r][c] = {
+                                    type: selectedPalettePart,
+                                    rotation: 0,
+                                    state: { on: true },
+                                    powered: false,
+                                    flowDir: 'fwd'
+                                };
+                            }
+                            solveCircuit();
+                            renderGrid();
+                        } else if (grid[r][c]) {
+                            const item = grid[r][c];
+                            if (item.type === 'switch') {
+                                item.state.on = !item.state.on;
+                            } else {
+                                item.rotation = (item.rotation + 90) % 360;
+                            }
+                            solveCircuit();
+                            renderGrid();
+                        }
+                    });
+
+                    board.appendChild(cell);
+                }
+            }
+        }
+
+        function handleDrop(targetR, targetC) {
+            if (!draggedData) return;
+            if (draggedData.source === 'palette') {
+                grid[targetR][targetC] = {
+                    type: draggedData.type,
+                    rotation: 0,
+                    state: { on: true },
+                    powered: false,
+                    flowDir: 'fwd'
+                };
+            } else if (draggedData.source === 'grid') {
+                const { r, c } = draggedData;
+                const temp = grid[targetR][targetC];
+                grid[targetR][targetC] = grid[r][c];
+                grid[r][c] = temp;
+            }
+            draggedData = null;
+            solveCircuit();
+            renderGrid();
+        }
+
+        const trash = document.getElementById('trash-bin');
+        if (trash) {
+            trash.addEventListener('dragover', (e) => e.preventDefault());
+            trash.addEventListener('drop', (e) => {
+                e.preventDefault();
+                if (draggedData && draggedData.source === 'grid') {
+                    grid[draggedData.r][draggedData.c] = null;
+                    solveCircuit();
+                    renderGrid();
+                }
+                draggedData = null;
+            });
+        }
+
+        function setupTouchSupport() {
+            const ghost = document.getElementById('touch-ghost');
+
+            document.addEventListener('touchstart', (e) => {
+                const target = e.target.closest('[draggable="true"]');
+                if (!target) return;
+
+                const touch = e.touches[0];
+                if (target.dataset.type) {
+                    draggedData = { source: 'palette', type: target.dataset.type };
+                } else {
+                    const cell = target.closest('[data-r]');
+                    if (cell) {
+                        draggedData = { source: 'grid', r: parseInt(cell.dataset.r), c: parseInt(cell.dataset.c) };
+                    }
+                }
+
+                if (draggedData) {
+                    touchState = { startX: touch.clientX, startY: touch.clientY, moved: false };
+                }
+            }, { passive: true });
+
+            document.addEventListener('touchmove', (e) => {
+                if (!touchState || !draggedData) return;
+                const touch = e.touches[0];
+                const dx = touch.clientX - touchState.startX;
+                const dy = touch.clientY - touchState.startY;
+
+                if (!touchState.moved && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
+                    touchState.moved = true;
+                    ghost.style.display = 'flex';
+                    ghost.innerHTML = `<i class="fa-solid fa-bolt text-white text-lg"></i>`;
+                }
+
+                if (touchState.moved) {
+                    ghost.style.left = `${touch.clientX}px`;
+                    ghost.style.top = `${touch.clientY}px`;
+                }
+            }, { passive: true });
+
+            document.addEventListener('touchend', (e) => {
+                ghost.style.display = 'none';
+                if (!touchState || !touchState.moved || !draggedData) {
+                    touchState = null;
+                    draggedData = null;   // 動かさず離したときに残らないようにクリア
+                    return;
+                }
+
+                const touch = e.changedTouches[0];
+                const dropElem = document.elementFromPoint(touch.clientX, touch.clientY);
+
+                if (dropElem) {
+                    const cell = dropElem.closest('[data-r]');
+                    if (cell) {
+                        handleDrop(parseInt(cell.dataset.r), parseInt(cell.dataset.c));
+                    } else if (dropElem.closest('#trash-bin')) {
+                        if (draggedData.source === 'grid') {
+                            grid[draggedData.r][draggedData.c] = null;
+                            solveCircuit();
+                            renderGrid();
+                        }
+                    }
+                }
+
+                touchState = null;
+                draggedData = null;
+            });
+        }
+
+        /* ================= 回路ソルバー (節点解析) ================= */
+        const E_BATTERY = 1.5;     // 乾電池1個の電圧 [V]
+        const R_INTERNAL = 0.5;    // 乾電池の内部抵抗 [Ω]
+        const G_WIRE = 100;        // 導線のコンダクタンス
+        const G_LEAK = 1e-7;       // 浮いた節点の安定化用
+        const I_ON = 1e-4;         // これ以上の電流で通電とみなす [A]
+        const I_SHORT = 1.0;       // 電池がこれ以上出したらショート [A]
+        const R_ELEM = { bulb: 10, resistor: 20, ammeter: 0.01, voltmeter: 1e6, led: 5, switch: 0.001 };
+
+        function solveLinear(A, rhs) {
+            const n = rhs.length;
+            for (let i = 0; i < n; i++) {
+                let p = i;
+                for (let k = i + 1; k < n; k++) if (Math.abs(A[k][i]) > Math.abs(A[p][i])) p = k;
+                [A[i], A[p]] = [A[p], A[i]];
+                [rhs[i], rhs[p]] = [rhs[p], rhs[i]];
+                const d = A[i][i];
+                for (let k = i + 1; k < n; k++) {
+                    const f = A[k][i] / d;
+                    if (!f) continue;
+                    for (let j = i; j < n; j++) A[k][j] -= f * A[i][j];
+                    rhs[k] -= f * rhs[i];
+                }
+            }
+            const x = new Array(n).fill(0);
+            for (let i = n - 1; i >= 0; i--) {
+                let s = rhs[i];
+                for (let j = i + 1; j < n; j++) s -= A[i][j] * x[j];
+                x[i] = s / A[i][i];
+            }
+            return x;
+        }
+
+        function solveCircuit() {
+            let any = false, hasBattery = false;
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    const cell = grid[r][c];
+                    if (!cell) continue;
+                    any = true;
+                    if (cell.type === 'battery') hasBattery = true;
+                    cell.powered = false;
+                    cell.flowDir = 'fwd';
+                }
+            }
+            if (!any) { updateStatus(false, "盤面にパーツを配置してください"); return; }
+            if (!hasBattery) { updateStatus(false, "開回路（電流なし）: 乾電池が配置されていません"); return; }
+
+            const OFF = [[-1, 0], [0, 1], [1, 0], [0, -1]];
+            const idMap = new Map();
+            const nid = (r, c, d) => {
+                const k = (r * COLS + c) * 5 + d;
+                if (!idMap.has(k)) idMap.set(k, idMap.size);
+                return idMap.get(k);
+            };
+            const portsOf = (cell) => {
+                const s = (cell.rotation || 0) / 90;
+                return PARTS[cell.type].ports.map(p => (p + s) % 4);
+            };
+
+            const edges = [];
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    const cell = grid[r][c];
+                    if (!cell) continue;
+                    const t = cell.type;
+                    const ports = portsOf(cell);
+
+                    if (t.startsWith('wire_')) {
+                        const ctr = nid(r, c, 4);
+                        ports.forEach((p, i) => edges.push({
+                            a: ctr, b: nid(r, c, p), g: G_WIRE, kind: 'wire', r, c, local: PARTS[t].ports[i]
+                        }));
+                    } else if (t === 'switch' && !cell.state.on) {
+                        // 開いたスイッチ
+                    } else if (t === 'battery') {
+                        edges.push({ a: nid(r, c, ports[0]), b: nid(r, c, ports[1]), g: 1 / R_INTERNAL, kind: 'battery', r, c });
+                    } else {
+                        edges.push({ a: nid(r, c, ports[0]), b: nid(r, c, ports[1]), g: 1 / R_ELEM[t], kind: t, r, c, on: true });
+                    }
+
+                    [1, 2].forEach(d => {
+                        if (!ports.includes(d)) return;
+                        const nr = r + OFF[d][0], nc = c + OFF[d][1];
+                        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) return;
+                        const nb = grid[nr][nc];
+                        if (!nb) return;
+                        const opp = (d + 2) % 4;
+                        if (!portsOf(nb).includes(opp)) return;
+                        edges.push({ a: nid(r, c, d), b: nid(nr, nc, opp), g: G_WIRE, kind: 'link' });
+                    });
+                }
+            }
+
+            const n = idMap.size;
+            const leds = edges.filter(e => e.kind === 'led');
+            let v = new Array(n).fill(0);
+            for (let it = 0; it < 8; it++) {
+                const A = Array.from({ length: n }, () => new Array(n).fill(0));
+                const rhs = new Array(n).fill(0);
+                for (let i = 0; i < n; i++) A[i][i] += G_LEAK;
+                edges.forEach(e => {
+                    if (e.kind === 'led' && !e.on) return;
+                    A[e.a][e.a] += e.g; A[e.b][e.b] += e.g;
+                    A[e.a][e.b] -= e.g; A[e.b][e.a] -= e.g;
+                    if (e.kind === 'battery') {
+                        rhs[e.a] += E_BATTERY * e.g;
+                        rhs[e.b] -= E_BATTERY * e.g;
+                    }
+                });
+                v = solveLinear(A, rhs);
+                let changed = false;
+                leds.forEach(e => {
+                    const on = (v[e.a] - v[e.b]) > 1e-9;
+                    if (on !== e.on) { e.on = on; changed = true; }
+                });
+                if (!changed) break;
+            }
+
+            let anyPowered = false, short = false;
+            edges.forEach(e => {
+                if (e.kind === 'link') return;
+                const cell = grid[e.r][e.c];
+                let I;
+                if (e.kind === 'wire') {
+                    I = (v[e.a] - v[e.b]) * e.g;
+                    if (Math.abs(I) > I_ON) {
+                        cell.powered = true;
+                        if (e.local === 1) cell.flowDir = I >= 0 ? 'fwd' : 'rev';
+                    }
+                    return;
+                }
+                if (e.kind === 'led' && !e.on) return;
+                if (e.kind === 'battery') {
+                    const out = (E_BATTERY - (v[e.a] - v[e.b])) * e.g;
+                    if (out > I_SHORT) short = true;
+                    I = -out;
+                } else {
+                    I = (v[e.a] - v[e.b]) * e.g;
+                }
+                if (Math.abs(I) > I_ON) {
+                    cell.powered = true;
+                    cell.flowDir = I >= 0 ? 'fwd' : 'rev';
+                    if (e.kind === 'battery') anyPowered = true;
+                }
+            });
+
+            if (short) {
+                updateStatus(true, "⚠ ショート回路: 電池が導線だけでつながっています（電池が熱くなり危険）");
+            } else if (anyPowered) {
+                updateStatus(true, "閉回路完成（通電中）: ＋極から−極へ電流が流れています");
+            } else {
+                updateStatus(false, "開回路（電流なし）: 乾電池からループがつながっていません");
+            }
+        }
+
+        function updateStatus(isPowered, message) {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            const banner = document.getElementById('status-banner');
+
+            text.textContent = message;
+
+            if (isPowered) {
+                dot.className = "w-2.5 h-2.5 rounded-full bg-sky-400 animate-ping shadow-[0_0_8px_#38bdf8]";
+                text.className = "text-xs font-bold text-sky-300";
+                banner.className = "px-5 py-1.5 rounded-full border border-sky-500/50 bg-sky-950/80 backdrop-blur shadow-lg flex items-center space-x-2.5 transition-all duration-300 shrink-0 mb-2";
+            } else {
+                dot.className = "w-2.5 h-2.5 rounded-full bg-slate-600";
+                text.className = "text-xs font-bold text-slate-300";
+                banner.className = "px-5 py-1.5 rounded-full border border-slate-800 bg-slate-900/90 backdrop-blur shadow-md flex items-center space-x-2.5 transition-all duration-300 shrink-0 mb-2";
+            }
+        }
+
+        function resetBoard() {
+            grid = Array(ROWS).fill(null).map(() => Array(COLS).fill(null));
+            selectedPalettePart = null;
+            updateSelectionBanner();
+            solveCircuit();
+            renderGrid();
+            renderPalette();
+        }
+
+        function printCircuit() {
+            window.print();
+        }
+
+        /* ================= USDZ出力 ================= */
+        function exportUSDZ() {
+            const MATS = {
+                BoardMat: [.05, .08, .14], TileMat: [.08, .12, .22], PoweredTileMat: [.12, .2, .35],
+                WireMat: [.2, .8, 1], UnpoweredWireMat: [.6, .65, .7], GoldMat: [1, .75, .1],
+                SilverMat: [.9, .9, .95], BulbMat: [1, .85, .1], LedMat: [.9, .1, .1],
+                AmMat: [.2, .6, .95], VoMat: [.75, .5, .95]
+            };
+            const mat = (n) => `</CircuitBoard/Materials/${n}>`;
+            const f = (x) => Number(x).toFixed(3);
+            const prim = (type, name, t, s, m) =>
+                `        def ${type} "${name}"\n        {\n` +
+                (type === 'Cylinder' ? `            uniform token axis = "Y"\n` : '') +
+                `            double3 xformOp:translate = (${t.map(f).join(', ')})\n` +
+                `            double3 xformOp:scale = (${s.map(f).join(', ')})\n` +
+                `            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]\n` +
+                `            rel material:binding = ${mat(m)}\n        }\n`;
+
+            let usda = `#usda 1.0\n(\n    defaultPrim = "CircuitBoard"\n    metersPerUnit = 0.05\n    upAxis = "Y"\n)\n\n`;
+            usda += `def Xform "CircuitBoard"\n(\n    kind = "component"\n)\n{\n    def Scope "Materials"\n    {\n`;
+            Object.keys(MATS).forEach(name => {
+                usda += `        def Material "${name}"\n        {\n` +
+                    `            token outputs:surface.connect = </CircuitBoard/Materials/${name}/PBR.outputs:surface>\n` +
+                    `            def Shader "PBR"\n            {\n` +
+                    `                uniform token info:id = "UsdPreviewSurface"\n` +
+                    `                color3f inputs:diffuseColor = (${MATS[name].join(', ')})\n` +
+                    `                token outputs:surface\n            }\n        }\n`;
+            });
             usda += `    }\n`;
+            usda += `    def Cube "BaseBoard"\n    {\n` +
+                `        double3 xformOp:translate = (0, -0.05, 0)\n` +
+                `        double3 xformOp:scale = (${f(COLS / 2 + 0.2)}, 0.05, ${f(ROWS / 2 + 0.2)})\n` +
+                `        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]\n` +
+                `        rel material:binding = ${mat('BoardMat')}\n    }\n`;
+
+            const DIR = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+            let tileIdx = 0;
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    const cell = grid[r][c];
+                    if (!cell) continue;
+                    const posX = (c - (COLS - 1) / 2), posZ = (r - (ROWS - 1) / 2);
+                    const wm = cell.powered ? 'WireMat' : 'UnpoweredWireMat';
+                    const tm = cell.powered ? 'PoweredTileMat' : 'TileMat';
+                    const t = cell.type;
+
+                    usda += `    def Xform "Tile_${tileIdx++}"\n    {\n` +
+                        `        double3 xformOp:translate = (${f(posX)}, 0.02, ${f(posZ)})\n` +
+                        `        float3 xformOp:rotateXYZ = (0, ${-(cell.rotation || 0)}, 0)\n` +
+                        `        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]\n`;
+                    usda += prim('Cube', 'TileBase', [0, 0, 0], [0.46, 0.02, 0.46], tm);
+
+                    if (t.startsWith('wire_')) {
+                        PARTS[t].ports.forEach((p, i) => {
+                            const [dx, dz] = DIR[p];
+                            const s = dx !== 0 ? [0.23, 0.015, 0.04] : [0.04, 0.015, 0.23];
+                            usda += prim('Cube', `Wire${i}`, [dx * 0.23, 0.03, dz * 0.23], s, wm);
+                        });
+                    } else {
+                        usda += prim('Cube', 'LegL', [-0.3, 0.03, 0], [0.16, 0.015, 0.04], wm);
+                        usda += prim('Cube', 'LegR', [0.3, 0.03, 0], [0.16, 0.015, 0.04], wm);
+                        if (t === 'battery') {
+                            usda += prim('Cube', 'PosPlate', [-0.08, 0.06, 0], [0.02, 0.08, 0.24], 'GoldMat');
+                            usda += prim('Cube', 'NegPlate', [0.08, 0.06, 0], [0.04, 0.05, 0.16], 'SilverMat');
+                        } else if (t === 'bulb') {
+                            usda += prim('Cylinder', 'Bulb', [0, 0.04, 0], [0.22, 0.02, 0.22], 'BulbMat');
+                        } else if (t === 'ammeter') {
+                            usda += prim('Cylinder', 'Ammeter', [0, 0.04, 0], [0.22, 0.02, 0.22], 'AmMat');
+                        } else if (t === 'voltmeter') {
+                            usda += prim('Cylinder', 'Voltmeter', [0, 0.04, 0], [0.22, 0.02, 0.22], 'VoMat');
+                        } else if (t === 'resistor') {
+                            usda += prim('Cube', 'Resistor', [0, 0.05, 0], [0.2, 0.04, 0.1], 'GoldMat');
+                        } else if (t === 'led') {
+                            usda += prim('Cube', 'LedBody', [-0.03, 0.05, 0], [0.12, 0.05, 0.12], 'LedMat');
+                            usda += prim('Cube', 'LedBar', [0.12, 0.06, 0], [0.02, 0.06, 0.15], 'SilverMat');
+                        } else if (t === 'switch') {
+                            const ang = cell.state.on ? 0 : 25;
+                            usda += `        def Cube "Lever"\n        {\n` +
+                                `            double3 xformOp:translate = (0, ${f(cell.state.on ? 0.04 : 0.09)}, 0)\n` +
+                                `            float3 xformOp:rotateXYZ = (0, 0, ${ang})\n` +
+                                `            double3 xformOp:scale = (0.16, 0.012, 0.03)\n` +
+                                `            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]\n` +
+                                `            rel material:binding = ${mat('SilverMat')}\n        }\n`;
+                            usda += prim('Cylinder', 'ContactL', [-0.14, 0.04, 0], [0.04, 0.03, 0.04], 'GoldMat');
+                            usda += prim('Cylinder', 'ContactR', [0.14, 0.04, 0], [0.04, 0.03, 0.04], 'GoldMat');
+                        }
+                    }
+                    usda += `    }\n`;
+                }
+            }
+            usda += `}\n`;
+
+            try {
+                const enc = new TextEncoder();
+                const data = enc.encode(usda);
+                const name = enc.encode("model.usda");
+
+                let pad = (64 - ((30 + name.length) % 64)) % 64;
+                if (pad > 0 && pad < 4) pad += 64;
+                const dataOffset = 30 + name.length + pad;
+                const cdSize = 46 + name.length;
+                const buf = new Uint8Array(dataOffset + data.length + cdSize + 22);
+                const dv = new DataView(buf.buffer);
+                const crc = crc32(data);
+
+                dv.setUint32(0, 0x04034b50, true);
+                dv.setUint16(4, 20, true);
+                dv.setUint32(14, crc, true);
+                dv.setUint32(18, data.length, true);
+                dv.setUint32(22, data.length, true);
+                dv.setUint16(26, name.length, true);
+                dv.setUint16(28, pad, true);
+                buf.set(name, 30);
+                if (pad >= 4) {
+                    const e = 30 + name.length;
+                    dv.setUint16(e, 0x1986, true);
+                    dv.setUint16(e + 2, pad - 4, true);
+                }
+                buf.set(data, dataOffset);
+
+                const cd = dataOffset + data.length;
+                dv.setUint32(cd, 0x02014b50, true);
+                dv.setUint16(cd + 4, 20, true);
+                dv.setUint16(cd + 6, 20, true);
+                dv.setUint32(cd + 16, crc, true);
+                dv.setUint32(cd + 20, data.length, true);
+                dv.setUint32(cd + 24, data.length, true);
+                dv.setUint16(cd + 28, name.length, true);
+                buf.set(name, cd + 46);
+
+                const eo = cd + cdSize;
+                dv.setUint32(eo, 0x06054b50, true);
+                dv.setUint16(eo + 8, 1, true);
+                dv.setUint16(eo + 10, 1, true);
+                dv.setUint32(eo + 12, cdSize, true);
+                dv.setUint32(eo + 16, cd, true);
+
+                const url = URL.createObjectURL(new Blob([buf], { type: 'model/vnd.usdz+zip' }));
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `教科書回路_3Dモデル_${Date.now()}.usdz`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            } catch (err) {
+                console.error("USDZ Export Error:", err);
+                alert("USDZファイルの生成に失敗しました。");
+            }
         }
-    }
-    usda += `}\n`;
 
-    try {
-        const enc = new TextEncoder();
-        const data = enc.encode(usda);
-        const name = enc.encode("model.usda");
+        function crc32(r){for(var c,o=[],a=0;a<256;a++){c=a;for(var e=0;e<8;e++)c=1&c?3988292384^c>>>1:c>>>1;o[a]=c}for(var n=-1,t=0;t<r.length;t++)n=n>>>8^o[255&(n^r[t])];return(-1^n)>>>0}
 
-        // データ開始位置を64byte境界に揃える。extra fieldは「ID(2)+長さ(2)+本体」の形式で書く
-        let pad = (64 - ((30 + name.length) % 64)) % 64;
-        if (pad > 0 && pad < 4) pad += 64;
-        const dataOffset = 30 + name.length + pad;
-        const cdSize = 46 + name.length;
-        const buf = new Uint8Array(dataOffset + data.length + cdSize + 22);
-        const dv = new DataView(buf.buffer);
-        const crc = crc32(data);
-
-        // Local File Header
-        dv.setUint32(0, 0x04034b50, true);
-        dv.setUint16(4, 20, true);
-        dv.setUint32(14, crc, true);
-        dv.setUint32(18, data.length, true);
-        dv.setUint32(22, data.length, true);
-        dv.setUint16(26, name.length, true);
-        dv.setUint16(28, pad, true);
-        buf.set(name, 30);
-        if (pad >= 4) {
-            const e = 30 + name.length;
-            dv.setUint16(e, 0x1986, true);       // USDZアライメント用のヘッダID
-            dv.setUint16(e + 2, pad - 4, true);
-        }
-        buf.set(data, dataOffset);
-
-        // Central Directory
-        const cd = dataOffset + data.length;
-        dv.setUint32(cd, 0x02014b50, true);
-        dv.setUint16(cd + 4, 20, true);
-        dv.setUint16(cd + 6, 20, true);
-        dv.setUint32(cd + 16, crc, true);
-        dv.setUint32(cd + 20, data.length, true);
-        dv.setUint32(cd + 24, data.length, true);
-        dv.setUint16(cd + 28, name.length, true);
-        buf.set(name, cd + 46);
-
-        // End of Central Directory
-        const eo = cd + cdSize;
-        dv.setUint32(eo, 0x06054b50, true);
-        dv.setUint16(eo + 8, 1, true);
-        dv.setUint16(eo + 10, 1, true);
-        dv.setUint32(eo + 12, cdSize, true);
-        dv.setUint32(eo + 16, cd, true);
-
-        const url = URL.createObjectURL(new Blob([buf], { type: 'model/vnd.usdz+zip' }));
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `教科書回路_3Dモデル_${Date.now()}.usdz`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-    } catch (err) {
-        console.error("USDZ Export Error:", err);
-        alert("USDZファイルの生成に失敗しました。");
-    }
-}
-
-
-/* ================= touchend の1行修正 =================
-   setupTouchSupport() 内の touchend ハンドラの冒頭を次のように変更:
-
-   document.addEventListener('touchend', (e) => {
-       ghost.style.display = 'none';
-       if (!touchState || !touchState.moved || !draggedData) {
-           touchState = null;
-           draggedData = null;      // ← この1行を追加
-           return;
-       }
-       ...
-   ====================================================== */
+        window.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>
